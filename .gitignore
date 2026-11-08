@@ -1,0 +1,9 @@
+.venv/
+.build-venv/
+__pycache__/
+.DS_Store
+build/
+build-browsers/
+dist/
+*.spec
+data/
