@@ -190,7 +190,7 @@ class Runner:
         logs=[dict(r) for r in c.execute("SELECT created_at,level,message FROM logs ORDER BY id DESC LIMIT 30")]
         runs=[dict(r) for r in c.execute("SELECT id,started_at,ended_at,status,start_number,max_records,interval_seconds,searched,found,error,export_path FROM runs ORDER BY id DESC LIMIT 20")]
         c.close()
-        return {"running": self.active_run is not None,"paused":not self.pause_event.is_set(),"waiting_for_human":not self.human_event.is_set() and bool(self.active_run),"next_number":pending,"searched_today":count,"latest_run":dict(latest) if latest else None,"settings":settings,"logs":logs,"runs":runs}
+        return {"running": self.active_run is not None,"stopping":self.stop_event.is_set() and self.active_run is not None,"paused":not self.pause_event.is_set(),"waiting_for_human":not self.human_event.is_set() and bool(self.active_run),"next_number":pending,"searched_today":count,"latest_run":dict(latest) if latest else None,"settings":settings,"logs":logs,"runs":runs}
 
     def start(self, cfg):
         with self.lock:
@@ -255,8 +255,13 @@ class Runner:
                     try:
                         self._portal_worker(c,rid,start,maxn,interval,p)
                     except Exception as e:
-                        c.execute("UPDATE runs SET status='error',ended_at=?,error=? WHERE id=?",(now(),str(e),rid))
-                        log(c,rid,"error",f"Run failed: {e}")
+                        if self.stop_event.is_set():
+                            self._export(c,rid)
+                            c.execute("UPDATE runs SET status='stopped',ended_at=? WHERE id=?",(now(),rid))
+                            log(c,rid,"info","Run stopped; browser session remains open.")
+                        else:
+                            c.execute("UPDATE runs SET status='error',ended_at=?,error=? WHERE id=?",(now(),str(e),rid))
+                            log(c,rid,"error",f"Run failed: {e}")
                     finally:
                         c.close(); self.active_run=None
         finally:
@@ -270,7 +275,7 @@ class Runner:
 
     def _ensure_browser(self,p):
         try:
-            pages=self.browser.pages if self.browser else []
+            pages=[page for context in self.browser.contexts for page in context.pages] if self.browser else []
         except Exception:
             self.browser=None; pages=[]
         if self.browser is None:
@@ -281,7 +286,10 @@ class Runner:
                 endpoint = chrome_debugging_websocket_url()
                 if not endpoint:
                     raise RuntimeError("Chrome DevToolsActivePort was not found")
-                self.browser=p.chromium.connect_over_cdp(endpoint, timeout=10000, no_defaults=True)
+                # no_defaults=False is required: with True, Playwright does not
+                # expose the existing browser context, so contexts is empty and
+                # the app cannot open/reuse a portal tab.
+                self.browser=p.chromium.connect_over_cdp(endpoint, timeout=20000, no_defaults=False)
             except Exception as e:
                 raise RuntimeError(
                     "Chrome's approved DevTools WebSocket did not complete its "
@@ -292,6 +300,10 @@ class Runner:
                     "Chrome window; it will not launch another Chrome process."
                 ) from e
             contexts=self.browser.contexts
+            if not contexts:
+                # Chrome can briefly expose no context right after it starts.
+                time.sleep(1.5)
+                contexts=self.browser.contexts
             pages=[page for context in contexts for page in context.pages]
         else:
             contexts=self.browser.contexts
@@ -311,7 +323,7 @@ class Runner:
                     portal_pages.append(page)
             except Exception: pass
         if portal_pages:
-            self.page=portal_pages[0]
+            self.page=min(portal_pages,key=lambda page: 0 if "inquiryabouteconomiclicenses" in page.url.lower() else 1 if "economiclicensedetails" in page.url.lower() else 2)
         elif contexts:
             try:
                 self.page=contexts[0].new_page()
@@ -327,19 +339,24 @@ class Runner:
                 "regular browser context in which to open the portal tab. Confirm "
                 "you enabled remote debugging in your normal Chrome profile."
             )
+        self.page.bring_to_front()
 
     def _portal_worker(self,c,rid,start,maxn,interval,p):
         self._ensure_browser(p)
+        self._check_stopped()
         try: current=self.page.url.lower()
         except Exception: current=""
-        if current in ("about:blank", "chrome://newtab/") or "economiclicensedetails" in current:
+        if "growth.gov.ae/g2c/inquiryabouteconomiclicenses" not in current and not any(host in current for host in ("id.moec.gov.ae", "uaepass.ae")):
             self.page.goto("https://www.growth.gov.ae/G2C/InquiryAboutEconomicLicenses",wait_until="domcontentloaded")
             try: self.page.wait_for_load_state("networkidle",timeout=8000)
             except Exception: pass
             log(c,rid,"info",f"Opened Growth portal in the existing Chrome window: {self.page.url}")
+        self._check_stopped()
         self._wait_for_login_page()
         self._ensure_authenticated(c,rid)
+        self._check_stopped()
         self._ensure_english_portal()
+        self._check_stopped()
         num=start; done=0
         while done < maxn and not self.stop_event.is_set():
             self.pause_event.wait()
@@ -356,8 +373,9 @@ class Runner:
                         c.execute("INSERT INTO records(run_id,license_number,searched_at,data_json) VALUES (?,?,?,?)",(rid,str(record.get("license_number",num)),now(),json.dumps(record,ensure_ascii=False)))
                 c.execute("UPDATE runs SET searched=searched+1,found=found+? WHERE id=?",(len(recs),rid))
                 log(c,rid,"info",f"License {num}: {'found '+str(len(recs))+' record(s)' if found else 'no result'}")
-                c.commit(); done+=1; num+=1; time.sleep(interval)
+                c.commit(); done+=1; num+=1; self.stop_event.wait(interval)
             except Exception as e:
+                if self.stop_event.is_set(): break
                 c.execute("INSERT OR REPLACE INTO searches(license_number,searched_at,run_id,outcome,error) VALUES (?,?,?,?,?)",(num,now(),rid,"error",str(e)))
                 log(c,rid,"error",f"License {num} could not be verified: {e}. The run has paused on this number.")
                 c.execute("UPDATE runs SET status='paused' WHERE id=?",(rid,)); c.commit()
@@ -372,17 +390,39 @@ class Runner:
         log(c,rid,"info",f"Run {status}; browser session remains open."); c.commit()
 
     def _pause_for_human(self,c,rid,status,message):
-        c.execute("UPDATE runs SET status=? WHERE id=?",(status,rid)); log(c,rid,"warning",message); c.commit()
-        self.human_event.clear(); self.pause_event.clear()
+        self.human_event.clear()
+        self.pause_event.clear()
+        c.execute("UPDATE runs SET status=? WHERE id=?", (status, rid))
+        log(c, rid, "warning", message)
+        c.commit()
         while not self.stop_event.is_set():
-            self.human_event.wait()
-            self.pause_event.wait()
-            if self.stop_event.is_set(): return
-            return
+            if status == "awaiting_login" and self._find_ready_portal():
+                self.resume()
+                return
+            if self.human_event.is_set():
+                return
+            if status == "awaiting_login" and self.browser:
+                # Pump Playwright events so redirects and newly opened tabs
+                # are delivered while the worker waits for manual sign-in.
+                self.page.context.pages[0].wait_for_timeout(500)
+            else:
+                self.human_event.wait(0.5)
+
+    def _find_ready_portal(self):
+        if self._portal_ready():
+            return True
+        # The sign-in flow can return to another tab in the same Chrome profile.
+        if self.page is None:
+            return False
+        for page in self.page.context.pages:
+            if page is not self.page and self._portal_ready(page):
+                self.page = page
+                return True
+        return False
 
     def _ensure_authenticated(self,c,rid):
         while not self.stop_event.is_set():
-            if self._portal_ready():
+            if self._find_ready_portal():
                 c.execute("UPDATE runs SET status='running' WHERE id=?",(rid,)); c.commit()
                 return
             page=self.page
@@ -418,7 +458,7 @@ class Runner:
             if self._is_challenge():
                 self._pause_for_human(c,rid,"awaiting_human","A CAPTCHA or verification step is open. Complete it in the visible browser, then click Resume.")
                 continue
-            self._pause_for_human(c,rid,"awaiting_login","Login is required. Complete the login in the visible browser, then click Resume.")
+            self._pause_for_human(c,rid,"awaiting_login","Waiting for the Growth license search form. Finish signing in in Chrome or switch to the signed-in license search tab.")
             if self._portal_ready():
                 c.execute("UPDATE runs SET status='running' WHERE id=?",(rid,)); c.commit(); return
 
@@ -530,19 +570,28 @@ class Runner:
         except Exception:
             return False
 
-    def _portal_ready(self):
-        if not self.page: return False
-        try:
-            url=self.page.url.lower()
-            if "uaepass" in url or "login" in url or "moec.gov.ae/account" in url: return False
-            if "growth.gov.ae" not in url: return False
-            for field in self.page.locator("input").all():
-                ph=(field.get_attribute("placeholder") or "").lower()
-                aria=(field.get_attribute("aria-label") or "").lower()
-                searchable=ph+" "+aria
-                if any(term in searchable for term in ("license", "economic", "الرخصة", "الاقتصادي", "السجل الاقتصادي")): return True
+    def _license_search_field(self, page):
+        terms = ("license", "economic", "الرخص", "الاقتصادي")
+        selector = ", ".join(
+            f'input[{attribute}*="{term}" i]'
+            for attribute in ("placeholder", "aria-label")
+            for term in terms
+        )
+        return page.locator(selector).filter(visible=True).first
+
+    def _portal_ready(self, page=None):
+        page = self.page if page is None else page
+        if page is None:
             return False
-        except Exception: return False
+        try:
+            url = urlparse(page.url)
+            if url.hostname not in ("growth.gov.ae", "www.growth.gov.ae"):
+                return False
+            if url.path.rstrip("/").lower() != "/g2c/inquiryabouteconomiclicenses":
+                return False
+            return self._license_search_field(page).is_visible()
+        except Exception:
+            return False
 
     def _ensure_english_portal(self):
         """Switch the portal to English when the language toggle offers it."""
@@ -558,120 +607,138 @@ class Runner:
             pass
 
     def _search_license(self,num):
+        self._check_stopped()
         page=self.page
-        boxes=page.locator("input").all()
-        target=None
-        for b in boxes:
+        # Drive the search by the portal's own results request. Reading the
+        # rendered table is unreliable: a click can be swallowed while the
+        # OutSystems app is still hydrating after a navigation, and a search
+        # with no matches renders no table at all.
+        payload=None; last_error=None
+        for attempt in range(5):
+            self._check_stopped()
             try:
-                ph=(b.get_attribute("placeholder") or "").lower()
-                aria=(b.get_attribute("aria-label") or "").lower()
-                if any(term in ph+" "+aria for term in ("license", "economic", "الرخصة", "الاقتصادي", "السجل الاقتصادي")): target=b; break
-            except Exception: pass
-        if target is None: raise RuntimeError("Could not identify portal license search field")
-        target.fill(str(num))
-        search=page.get_by_role("button",name="Search",exact=True)
-        if search.count()==0: search=page.get_by_role("button",name="بحث",exact=True)
-        search.click()
+                target=self._license_search_field(page)
+                target.fill(str(num))
+                search=page.get_by_role("button",name="Search",exact=True)
+                if search.count()==0: search=page.get_by_role("button",name="بحث",exact=True)
+                with page.expect_response(
+                    lambda r: "DataActionGetEconomicLicences2" in r.url,
+                    timeout=6000,
+                ) as info:
+                    search.click()
+                payload=info.value.json()
+                break
+            except Exception as e:
+                last_error=e
+                try: page.wait_for_timeout(1200)
+                except Exception: time.sleep(1.2)
+        if payload is None:
+            raise RuntimeError(f"License {num}: the portal did not answer the search request ({last_error}); retry this number")
+        records=(((payload or {}).get("data") or {}).get("List") or {}).get("List") or []
+        if not records:
+            return False,[]
+        out=[]; results_url=page.url
         try:
-            page.wait_for_function("""() => {
-                const nodes = [...document.querySelectorAll('[aria-busy="true"], [role="progressbar"], [class*="spinner" i], [class*="loading" i], [class*="loader" i]')];
-                return !nodes.some(el => {
-                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0 && r.width > 0 && r.height > 0;
-                });
-            }""", timeout=30000)
-        except Exception as e:
-            raise RuntimeError(f"Portal results remained in a loading state: {e}") from e
-        try: page.wait_for_load_state("networkidle", timeout=8000)
-        except Exception: pass
-        # OutSystems updates the table asynchronously after the overlay goes
-        # away. Wait for a settled row or a real empty-results message.
-        try:
-            page.wait_for_function("""() => {
-                const rows=[...document.querySelectorAll('table tbody tr')];
-                return rows.some(row => /\\b\\d{15,}\\b/.test(row.innerText))
-                    || rows.some(row => /no records|no data|no matching|لا توجد|لم يتم العثور|لا يوجد بيانات/i.test(row.innerText));
-            }""", timeout=30000)
-        except Exception as e:
-            raise RuntimeError(f"License {num}: results did not settle into a record or an empty result: {e}") from e
-        rows=page.locator("table tbody tr"); n=rows.count(); out=[]; visible_result_rows=0; empty_result_rows=0; detail_urls=[]
-        for i in range(n):
-            row=rows.nth(i); text=row.inner_text()
-            lower=text.lower().strip()
-            if not lower: continue
-            if any(marker in lower for marker in ("no records", "no data", "no matching", "لا توجد", "لم يتم العثور", "لا يوجد بيانات")):
-                empty_result_rows+=1
-                continue
-            visible_result_rows+=1
-            import re
-            links=row.locator("a")
-            row_hrefs=[]
-            detail_text=row.get_by_text(re.compile(r"details|التفاصيل|تفاصيل",re.I))
-            for link in links.all():
-                try:
-                    href=link.evaluate("element => element.href")
-                    if href and "economiclicensedetails" in href.lower():
-                        row_hrefs.append(href)
-                except Exception:
+            for record in records:
+                self._check_stopped()
+                ern=str(record.get("UnifiedNumber") or "").strip()
+                if not ern:
                     continue
-            if not row_hrefs:
-                if detail_text.count():
-                    # The visible text can be nested in a span inside the link.
-                    anchor=detail_text.first.locator("xpath=ancestor-or-self::a[1]")
-                    if anchor.count():
-                        try:
-                            href=anchor.first.evaluate("element => element.href")
-                            if href and "economiclicensedetails" in href.lower():
-                                row_hrefs.append(href)
-                        except Exception:
-                            pass
-            if not row_hrefs:
-                # The portal can render Details as a scripted control. Its
-                # detail URL is built from the ERN shown in the result row.
-                ern=re.search(r"\b\d{15,}\b",text)
-                if ern:
-                    row_hrefs.append(urljoin(page.url,"/G2C/EconomicLicenseDetails?LicenceNumber="+ern.group()))
-            for href in row_hrefs:
-                href=urljoin(page.url,href)
-                if href not in detail_urls:
-                    detail_urls.append(href)
-
-        # Capture the result links before navigating. The previous loop clicked
-        # the first Details link, then looked for more rows on the detail page;
-        # consequently only the first result could ever be considered.
-        if detail_urls:
-            results_url=page.url
-            try:
-                for href in detail_urls:
-                    page.goto(href,wait_until="domcontentloaded",timeout=20000)
-                    if "economiclicensedetails" not in page.url.lower():
-                        raise RuntimeError(f"License {num}: Details URL did not open a license detail page ({href})")
-                    try: page.wait_for_load_state("networkidle",timeout=5000)
-                    except Exception: pass
-                    record=self._extract_detail_record(num)
-                    out.append(record)
-            finally:
-                # Keep the next sequential search on the portal search form,
-                # even if a detail page is malformed or times out.
-                if "economiclicensedetails" in page.url.lower():
-                    page.goto(results_url,wait_until="domcontentloaded",timeout=20000)
-        if visible_result_rows and not detail_urls:
-            raise RuntimeError(f"License {num}: {visible_result_rows} result row(s) appeared, but no clickable Details links were found")
-        if visible_result_rows and not out:
-            raise RuntimeError(f"License {num}: {visible_result_rows} result row(s) appeared, but no details were extracted")
-        if not visible_result_rows and not empty_result_rows:
-            raise RuntimeError(f"License {num}: search results did not finish loading; retry this number")
+                href=urljoin(page.url,"/G2C/EconomicLicenseDetails?LicenceNumber="+ern)
+                page.goto(href,wait_until="domcontentloaded",timeout=20000)
+                self._check_stopped()
+                if "economiclicensedetails" not in page.url.lower():
+                    raise RuntimeError(f"License {num}: Details URL did not open a license detail page ({href})")
+                # The portal renders the detail fields after the initial
+                # document load; wait for them before extracting.
+                try: page.wait_for_load_state("networkidle",timeout=8000)
+                except Exception: pass
+                if not self._wait_for_detail_ready(num):
+                    saved=self._save_detail_diagnostic(num)
+                    raise RuntimeError(
+                        f"License {num}: the Details page opened but its fields never rendered"
+                        + (f" (diagnostic saved to {saved})" if saved else "")
+                    )
+                out.append(self._extract_detail_record(num))
+        finally:
+            # Keep the next sequential search on the portal search form.
+            if not self.stop_event.is_set() and "economiclicensedetails" in page.url.lower():
+                page.goto(results_url,wait_until="domcontentloaded",timeout=20000)
+                try: self._license_search_field(page).wait_for(state="visible",timeout=10000)
+                except Exception: pass
         return bool(out),out
+
+    def _check_stopped(self):
+        if self.stop_event.is_set():
+            raise RuntimeError("Run stopped")
+
+    def _wait_for_portal_result(self, expression, seconds):
+        deadline=time.monotonic()+seconds
+        while time.monotonic()<deadline:
+            self._check_stopped()
+            try:
+                self.page.wait_for_function(expression,timeout=1000)
+                return
+            except Exception as error:
+                if "Timeout" not in type(error).__name__:
+                    raise
+        raise TimeoutError("Portal result did not appear before the timeout")
+
+    def _wait_for_detail_ready(self, num, timeout_seconds=20):
+        """Wait until the portal has rendered labelled detail fields."""
+        deadline=time.monotonic()+timeout_seconds
+        while time.monotonic()<deadline:
+            self._check_stopped()
+            try:
+                ready=self.page.evaluate("""() => {
+                    const items=[...document.querySelectorAll('.basic-info .item')];
+                    const labelled=items.some(node => {
+                        const title=(node.querySelector(':scope > .title')?.textContent||'').trim();
+                        const value=(node.querySelector('.value')?.textContent||'').trim();
+                        return title && value;
+                    });
+                    if (labelled) return true;
+                    const text=(document.body?.innerText||'').toLowerCase();
+                    return /license number|license status|رقم الرخصة|حالة الرخصة/.test(text);
+                }""")
+                if ready: return True
+            except Exception:
+                # The document may still be navigating; retry until deadline.
+                pass
+            try: self.page.wait_for_timeout(500)
+            except Exception: time.sleep(0.5)
+        return False
+
+    def _save_detail_diagnostic(self, num):
+        """Save the unrendered Details page for offline selector work."""
+        try:
+            folder=DATA/"diagnostics"; folder.mkdir(parents=True,exist_ok=True)
+            stamp=datetime.now().strftime("%Y%m%d-%H%M%S")
+            base=folder/f"detail-{num}-{stamp}"
+            base.with_suffix(".html").write_text(self.page.content(),encoding="utf-8")
+            base.with_suffix(".txt").write_text(
+                f"URL: {self.page.url}\n\n"+self.page.locator("body").inner_text()[:8000],
+                encoding="utf-8",
+            )
+            return base.with_suffix(".html").relative_to(DATA)
+        except Exception:
+            return None
 
     def _extract_detail_record(self, searched_number):
         import re
 
         # OutSystems renders each label and value as sibling spans. Reading
         # body text loses empty mailboxes and multi-value manager lists.
-        items=self.page.locator(".tabs-content-tab.open .basic-info .item").evaluate_all("""nodes => nodes.map(node => ({
+        def read_items(selector):
+            return self.page.locator(selector).evaluate_all("""nodes => nodes.map(node => ({
             label: (node.querySelector(':scope > .title')?.textContent || '').replace(/\\s+/g, ' ').trim().replace(/\\s*[:：]$/, '').toLowerCase(),
             values: [...node.querySelectorAll(':scope > .value, :scope > ul .value')].map(el => el.textContent.trim())
         }))""")
+        items=read_items(".tabs-content-tab.open .basic-info .item")
+        if not items:
+            # The Details page can open on a different tab; read every rendered
+            # basic-info block rather than only the currently active one.
+            items=read_items(".basic-info .item")
         if items:
             record={field:"" for field in FIELDS}
             mailboxes=[]
@@ -734,8 +801,18 @@ class Runner:
         path.write_bytes(xlsx_bytes(FIELDS,rows)); c.execute("UPDATE runs SET export_path=? WHERE id=?",(str(path.relative_to(EXPORTS)),rid)); c.commit()
 
     def pause(self): self.pause_event.clear()
-    def resume(self): self.human_event.set(); self.pause_event.set()
-    def stop(self): self.stop_event.set(); self.human_event.set(); self.pause_event.set()
+    def resume(self):
+        self.pause_event.set()
+        self.human_event.set()
+    def stop(self):
+        self.stop_event.set(); self.human_event.set(); self.pause_event.set()
+        with self.lock:
+            if self.active_run is not None:
+                c=db()
+                changed=c.execute("UPDATE runs SET status='stopping' WHERE id=? AND status NOT IN ('stopped','completed','error')",(self.active_run,)).rowcount
+                if changed:
+                    log(c,self.active_run,"info","Stop requested; finishing the current browser step and saving collected records.")
+                c.close()
 
 RUNNER=Runner()
 
@@ -746,7 +823,7 @@ class Handler(BaseHTTPRequestHandler):
         path=urlparse(self.path).path
         if path=="/api/state": return self._json(RUNNER.state())
         if path=="/":
-            raw=(STATIC/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            raw=(STATIC/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         if path.startswith("/exports/"):
             relative_path=unquote(path.removeprefix("/exports/"))
             filepath=(EXPORTS/relative_path).resolve()
@@ -761,7 +838,20 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/resume": RUNNER.resume(); return self._json({"ok":True})
             if path=="/api/stop": RUNNER.stop(); return self._json({"ok":True})
             if path=="/api/settings":
-                c=db(); initial=int(payload.get("initial_number",10000)); c.execute("UPDATE settings SET value=? WHERE key='initial_number'",(str(initial),)); c.commit(); c.close(); return self._json({"ok":True})
+                c=db()
+                try:
+                    current={r["key"]:r["value"] for r in c.execute("SELECT key,value FROM settings")}
+                    initial=int(payload.get("initial_number",current["initial_number"]))
+                    max_records=int(payload.get("max_records",current["max_records"]))
+                    interval=float(payload.get("interval_seconds",current["interval_seconds"]))
+                    if initial < 1: raise ValueError("Starting number must be at least 1")
+                    if max_records < 1 or max_records > 100000: raise ValueError("Maximum numbers must be between 1 and 100000")
+                    if interval < 0.5 or interval > 3600: raise ValueError("Interval must be between 0.5 and 3600 seconds")
+                    c.executemany("UPDATE settings SET value=? WHERE key=?",[(str(initial),"initial_number"),(str(max_records),"max_records"),(str(interval),"interval_seconds")])
+                    c.commit()
+                finally:
+                    c.close()
+                return self._json({"ok":True})
             return self.send_error(404)
         except Exception as e: return self._json({"error":str(e)},400)
     def log_message(self,*args): pass
