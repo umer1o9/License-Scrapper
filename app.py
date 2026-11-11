@@ -14,7 +14,7 @@ import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from xml.sax.saxutils import escape
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -99,10 +99,21 @@ def db():
     c.executescript("""
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, ended_at TEXT, status TEXT NOT NULL, start_number INTEGER NOT NULL, max_records INTEGER NOT NULL, interval_seconds REAL NOT NULL, searched INTEGER DEFAULT 0, found INTEGER DEFAULT 0, error TEXT, export_path TEXT);
-    CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, license_number TEXT NOT NULL, searched_at TEXT NOT NULL, data_json TEXT NOT NULL, UNIQUE(license_number, run_id));
+    CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, license_number TEXT NOT NULL, searched_at TEXT NOT NULL, data_json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS searches (license_number INTEGER PRIMARY KEY, searched_at TEXT NOT NULL, run_id INTEGER NOT NULL, outcome TEXT NOT NULL, error TEXT);
     CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, created_at TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL);
     """)
+    # One search can legitimately return several businesses with the same
+    # displayed license number. Older databases had UNIQUE(license_number,
+    # run_id), which silently discarded all but the first result row.
+    unique_indexes = c.execute("PRAGMA index_list(records)").fetchall()
+    if any(index[2] and any(col[2] in ("license_number", "run_id") for col in c.execute(f"PRAGMA index_info('{index[1]}')").fetchall()) for index in unique_indexes):
+        c.executescript("""
+        CREATE TABLE records_migrated (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, license_number TEXT NOT NULL, searched_at TEXT NOT NULL, data_json TEXT NOT NULL);
+        INSERT INTO records_migrated(id,run_id,license_number,searched_at,data_json) SELECT id,run_id,license_number,searched_at,data_json FROM records;
+        DROP TABLE records;
+        ALTER TABLE records_migrated RENAME TO records;
+        """)
     for k, v in {"initial_number": "10000", "max_records": "100", "interval_seconds": "2"}.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k,v))
     c.commit()
@@ -167,6 +178,12 @@ class Runner:
         settings={r["key"]:r["value"] for r in c.execute("SELECT * FROM settings")}
         if latest:
             pending=int(latest["start_number"])+int(latest["searched"] or 0)
+            first_error=c.execute(
+                "SELECT MIN(license_number) FROM searches WHERE run_id=? AND outcome='error'",
+                (latest["id"],),
+            ).fetchone()[0]
+            if first_error is not None:
+                pending=min(pending,int(first_error))
         else:
             pending=(int(last)+1) if last is not None else int(settings["initial_number"])
         count=c.execute("SELECT COUNT(*) FROM searches WHERE substr(searched_at,1,10)=?",(datetime.now().astimezone().date().isoformat(),)).fetchone()[0]
@@ -183,6 +200,12 @@ class Runner:
             last=c.execute("SELECT MAX(license_number) FROM searches").fetchone()[0]
             latest=c.execute("SELECT start_number,searched FROM runs ORDER BY id DESC LIMIT 1").fetchone()
             automatic=(int(latest["start_number"])+int(latest["searched"] or 0)) if latest else ((int(last)+1) if last is not None else int(st["initial_number"]))
+            if latest:
+                first_error=c.execute(
+                    "SELECT MIN(license_number) FROM searches WHERE run_id=(SELECT MAX(id) FROM runs) AND outcome='error'"
+                ).fetchone()[0]
+                if first_error is not None:
+                    automatic=min(automatic,int(first_error))
             start=int(cfg["start_number"]) if cfg.get("start_number") not in (None,"") else automatic
             if start < 1: raise ValueError("Starting license number must be at least 1")
             maxn=int(cfg.get("max_records",st["max_records"])); interval=float(cfg.get("interval_seconds",st["interval_seconds"]))
@@ -265,41 +288,44 @@ class Runner:
                     "connection. If Chrome is showing a permission prompt, allow "
                     "this app to connect, then try Start again. Confirm remote "
                     "debugging is enabled in the same Chrome profile. The scraper "
-                    "will reuse an existing Growth tab or blank tab; it will not "
-                    "open a new tab or browser window."
+                    "will reuse an existing Growth tab or open a tab in that same "
+                    "Chrome window; it will not launch another Chrome process."
                 ) from e
-            pages=[page for context in self.browser.contexts for page in context.pages]
+            contexts=self.browser.contexts
+            pages=[page for context in contexts for page in context.pages]
+        else:
+            contexts=self.browser.contexts
         open_pages=[]
         for page in pages:
             try:
                 if not page.is_closed(): open_pages.append(page)
             except Exception: pass
-        # Prefer an existing portal tab, then an existing blank/new-tab page.
-        # Never create a tab or commandeer an unrelated page.
+        # Prefer an existing portal tab to preserve the user's session. If
+        # there isn't one, create a visible tab inside the already attached
+        # regular Chrome context; this never launches another browser process.
         portal_pages=[]
-        blank_pages=[]
         for page in open_pages:
             try:
                 url=page.url.lower()
                 if any(host in url for host in ("growth.gov.ae","id.moec.gov.ae","uaepass.ae")):
                     portal_pages.append(page)
-                elif url in ("about:blank", "chrome://newtab/"):
-                    blank_pages.append(page)
             except Exception: pass
         if portal_pages:
             self.page=portal_pages[0]
-        elif blank_pages:
-            # Reuse an existing blank tab as the portal tab. Previously this
-            # selected the blank page but did not navigate it until later in
-            # the worker; the login wait could then be entered before the
-            # portal login flow was actually visible to the user.
-            self.page=blank_pages[0]
+        elif contexts:
+            try:
+                self.page=contexts[0].new_page()
+            except Exception as e:
+                raise RuntimeError(
+                    "Connected to the existing Chrome browser, but could not "
+                    "open a portal tab in its regular window. Keep Chrome open, "
+                    "confirm remote debugging is enabled, and try Start again."
+                ) from e
         else:
             raise RuntimeError(
-                "Chrome is connected, but there is no existing Growth portal tab "
-                "or blank tab available to use. Navigate an existing tab to the "
-                "Growth portal or leave an existing blank tab open; the scraper "
-                "will not create a new tab or replace another page."
+                "Chrome's debugging connection succeeded, but Chrome exposed no "
+                "regular browser context in which to open the portal tab. Confirm "
+                "you enabled remote debugging in your normal Chrome profile."
             )
 
     def _portal_worker(self,c,rid,start,maxn,interval,p):
@@ -310,6 +336,7 @@ class Runner:
             self.page.goto("https://www.growth.gov.ae/G2C/InquiryAboutEconomicLicenses",wait_until="domcontentloaded")
             try: self.page.wait_for_load_state("networkidle",timeout=8000)
             except Exception: pass
+            log(c,rid,"info",f"Opened Growth portal in the existing Chrome window: {self.page.url}")
         self._wait_for_login_page()
         self._ensure_authenticated(c,rid)
         self._ensure_english_portal()
@@ -326,14 +353,19 @@ class Runner:
                 c.execute("INSERT OR REPLACE INTO searches(license_number,searched_at,run_id,outcome,error) VALUES (?,?,?,?,NULL)",(num,now(),rid,"found" if found else "not_found"))
                 if found:
                     for record in recs:
-                        c.execute("INSERT OR IGNORE INTO records(run_id,license_number,searched_at,data_json) VALUES (?,?,?,?)",(rid,str(record.get("license_number",num)),now(),json.dumps(record,ensure_ascii=False)))
+                        c.execute("INSERT INTO records(run_id,license_number,searched_at,data_json) VALUES (?,?,?,?)",(rid,str(record.get("license_number",num)),now(),json.dumps(record,ensure_ascii=False)))
                 c.execute("UPDATE runs SET searched=searched+1,found=found+? WHERE id=?",(len(recs),rid))
                 log(c,rid,"info",f"License {num}: {'found '+str(len(recs))+' record(s)' if found else 'no result'}")
                 c.commit(); done+=1; num+=1; time.sleep(interval)
             except Exception as e:
                 c.execute("INSERT OR REPLACE INTO searches(license_number,searched_at,run_id,outcome,error) VALUES (?,?,?,?,?)",(num,now(),rid,"error",str(e)))
-                log(c,rid,"error",f"License {num} error: {e}"); c.execute("UPDATE runs SET searched=searched+1 WHERE id=?",(rid,)); c.commit()
-                done+=1; num+=1; time.sleep(interval)
+                log(c,rid,"error",f"License {num} could not be verified: {e}. The run has paused on this number.")
+                c.execute("UPDATE runs SET status='paused' WHERE id=?",(rid,)); c.commit()
+                self.pause_event.clear()
+                while not self.stop_event.is_set() and not self.pause_event.wait(1):
+                    pass
+                if not self.stop_event.is_set():
+                    c.execute("UPDATE runs SET status='running' WHERE id=?",(rid,)); c.commit()
         self._export(c,rid)
         status="stopped" if self.stop_event.is_set() else "completed"
         c.execute("UPDATE runs SET status=?,ended_at=? WHERE id=?",(status,now(),rid))
@@ -552,48 +584,144 @@ class Runner:
             raise RuntimeError(f"Portal results remained in a loading state: {e}") from e
         try: page.wait_for_load_state("networkidle", timeout=8000)
         except Exception: pass
-        page.wait_for_timeout(500)
-        rows=page.locator("table tbody tr"); n=rows.count(); out=[]; visible_result_rows=0
+        # OutSystems updates the table asynchronously after the overlay goes
+        # away. Wait for a settled row or a real empty-results message.
+        try:
+            page.wait_for_function("""() => {
+                const rows=[...document.querySelectorAll('table tbody tr')];
+                return rows.some(row => /\\b\\d{15,}\\b/.test(row.innerText))
+                    || rows.some(row => /no records|no data|no matching|لا توجد|لم يتم العثور|لا يوجد بيانات/i.test(row.innerText));
+            }""", timeout=30000)
+        except Exception as e:
+            raise RuntimeError(f"License {num}: results did not settle into a record or an empty result: {e}") from e
+        rows=page.locator("table tbody tr"); n=rows.count(); out=[]; visible_result_rows=0; empty_result_rows=0; detail_urls=[]
         for i in range(n):
             row=rows.nth(i); text=row.inner_text()
             lower=text.lower().strip()
             if not lower: continue
-            if any(marker in lower for marker in ("no records", "no data", "no matching", "لا توجد", "لم يتم العثور", "لا يوجد بيانات")): continue
+            if any(marker in lower for marker in ("no records", "no data", "no matching", "لا توجد", "لم يتم العثور", "لا يوجد بيانات")):
+                empty_result_rows+=1
+                continue
             visible_result_rows+=1
-            detail=row.locator('a[href*="EconomicLicenseDetails"]')
-            if detail.count()==0:
-                import re
-                detail=row.get_by_text(re.compile(r"details|التفاصيل|تفاصيل",re.I))
-            if detail.count()==0:
-                raise RuntimeError(f"License {num}: result row appeared, but its Details link was not recognized: {text[:180]}")
-            detail.first.click(); page.wait_for_load_state("domcontentloaded",timeout=10000)
-            if "economiclicensedetails" not in page.url.lower():
-                try: page.wait_for_url("**/EconomicLicenseDetails**",timeout=8000)
-                except Exception as e: raise RuntimeError(f"License {num}: Details link did not open a license detail page") from e
-            body=page.locator("body").inner_text()
-            record={f:"" for f in FIELDS}
-            record["license_number"]=str(num)
-            for field,labels in [
-                ("license_status",("License status","License Status","حالة الرخصة","حالة الترخيص")),
-                ("english_name",("English Name","Economic Name in English","الاسم باللغة الإنجليزية","الاسم الاقتصادي باللغة الإنجليزية")),
-                ("mobile_number",("Mobile number","Mobile","Phone number","رقم الهاتف المتحرك","رقم الهاتف")),
-                ("mailbox_1",("Mailbox 1","Mailbox","Email","البريد الإلكتروني","البريد الالكتروني")),
-                ("mailbox_2",("Mailbox 2","Secondary Email","البريد الإلكتروني 2","البريد الالكتروني 2")),
-                ("manager_names_english",("Manager Names In English","Manager Names in English","Managers in English","أسماء المديرين باللغة الإنجليزية","أسماء المديرين بالإنجليزية")),
-            ]:
-                import re
-                for label in labels:
-                    m=re.search(re.escape(label)+r"\s*[:：]?\s*([^\n]+)",body,re.I)
-                    if m:
-                        record[field]=m.group(1).strip()
-                        break
-            if not any(record[k] for k in ("license_status","english_name","mobile_number","mailbox_1","mailbox_2","manager_names_english")):
-                raise RuntimeError(f"License {num}: opened Details, but none of the requested fields were recognized")
-            out.append(record)
-            page.go_back(wait_until="domcontentloaded")
+            import re
+            links=row.locator("a")
+            row_hrefs=[]
+            detail_text=row.get_by_text(re.compile(r"details|التفاصيل|تفاصيل",re.I))
+            for link in links.all():
+                try:
+                    href=link.evaluate("element => element.href")
+                    if href and "economiclicensedetails" in href.lower():
+                        row_hrefs.append(href)
+                except Exception:
+                    continue
+            if not row_hrefs:
+                if detail_text.count():
+                    # The visible text can be nested in a span inside the link.
+                    anchor=detail_text.first.locator("xpath=ancestor-or-self::a[1]")
+                    if anchor.count():
+                        try:
+                            href=anchor.first.evaluate("element => element.href")
+                            if href and "economiclicensedetails" in href.lower():
+                                row_hrefs.append(href)
+                        except Exception:
+                            pass
+            if not row_hrefs:
+                # The portal can render Details as a scripted control. Its
+                # detail URL is built from the ERN shown in the result row.
+                ern=re.search(r"\b\d{15,}\b",text)
+                if ern:
+                    row_hrefs.append(urljoin(page.url,"/G2C/EconomicLicenseDetails?LicenceNumber="+ern.group()))
+            for href in row_hrefs:
+                href=urljoin(page.url,href)
+                if href not in detail_urls:
+                    detail_urls.append(href)
+
+        # Capture the result links before navigating. The previous loop clicked
+        # the first Details link, then looked for more rows on the detail page;
+        # consequently only the first result could ever be considered.
+        if detail_urls:
+            results_url=page.url
+            try:
+                for href in detail_urls:
+                    page.goto(href,wait_until="domcontentloaded",timeout=20000)
+                    if "economiclicensedetails" not in page.url.lower():
+                        raise RuntimeError(f"License {num}: Details URL did not open a license detail page ({href})")
+                    try: page.wait_for_load_state("networkidle",timeout=5000)
+                    except Exception: pass
+                    record=self._extract_detail_record(num)
+                    out.append(record)
+            finally:
+                # Keep the next sequential search on the portal search form,
+                # even if a detail page is malformed or times out.
+                if "economiclicensedetails" in page.url.lower():
+                    page.goto(results_url,wait_until="domcontentloaded",timeout=20000)
+        if visible_result_rows and not detail_urls:
+            raise RuntimeError(f"License {num}: {visible_result_rows} result row(s) appeared, but no clickable Details links were found")
         if visible_result_rows and not out:
             raise RuntimeError(f"License {num}: {visible_result_rows} result row(s) appeared, but no details were extracted")
+        if not visible_result_rows and not empty_result_rows:
+            raise RuntimeError(f"License {num}: search results did not finish loading; retry this number")
         return bool(out),out
+
+    def _extract_detail_record(self, searched_number):
+        import re
+
+        # OutSystems renders each label and value as sibling spans. Reading
+        # body text loses empty mailboxes and multi-value manager lists.
+        items=self.page.locator(".tabs-content-tab.open .basic-info .item").evaluate_all("""nodes => nodes.map(node => ({
+            label: (node.querySelector(':scope > .title')?.textContent || '').replace(/\\s+/g, ' ').trim().replace(/\\s*[:：]$/, '').toLowerCase(),
+            values: [...node.querySelectorAll(':scope > .value, :scope > ul .value')].map(el => el.textContent.trim())
+        }))""")
+        if items:
+            record={field:"" for field in FIELDS}
+            mailboxes=[]
+            for item in items:
+                label=item["label"]
+                value="; ".join(v for v in item["values"] if v)
+                if label=="license status": record["license_status"]=value
+                elif label=="license number": record["license_number"]=value
+                elif label=="english name": record["english_name"]=value
+                elif label=="mobile number": record["mobile_number"]=value
+                elif label=="mail box": mailboxes.append(value)
+                elif label=="manager names in english": record["manager_names_english"]=value
+            record["mailbox_1"]=(mailboxes+[""])[0]
+            record["mailbox_2"]=(mailboxes+["",""])[1]
+            if record["license_number"] and record["english_name"]:
+                return record
+
+        body=self.page.locator("body").inner_text()
+        lines=[re.sub(r"\s+"," ",line).strip() for line in body.splitlines()]
+        lines=[line for line in lines if line]
+        record={field:"" for field in FIELDS}
+        labels_by_field=[
+            ("license_status",("License status","License Status","حالة الرخصة","حالة الترخيص")),
+            ("license_number",("License number","رقم الرخصة","رقم الترخيص")),
+            ("english_name",("English Name","Economic Name in English","الاسم باللغة الإنجليزية","الاسم الاقتصادي باللغة الإنجليزية")),
+            ("mobile_number",("Mobile number","Mobile","Phone number","رقم الهاتف المتحرك","رقم الهاتف")),
+            ("mailbox_1",("Mailbox 1","Mailbox","Email","البريد الإلكتروني","البريد الالكتروني")),
+            ("mailbox_2",("Mailbox 2","Secondary Email","البريد الإلكتروني 2","البريد الالكتروني 2")),
+            ("manager_names_english",("Manager Names In English","Manager Names in English","Managers in English","أسماء المديرين باللغة الإنجليزية","أسماء المديرين بالإنجليزية")),
+        ]
+        for field,labels in labels_by_field:
+            for label in labels:
+                pattern=re.compile(r"^\s*"+re.escape(label)+r"\s*[:：]?\s*(.*?)\s*$",re.I)
+                for index,line in enumerate(lines):
+                    match=pattern.match(line)
+                    if not match:
+                        continue
+                    value=match.group(1).strip()
+                    if not value and index+1<len(lines):
+                        value=lines[index+1]
+                    if value and value.lower() not in ("license status","license number","english name","mobile number","mailbox","manager names in english"):
+                        record[field]=value
+                        break
+                if record[field]:
+                    break
+        if not record["license_number"]:
+            record["license_number"]=str(searched_number)
+        if not any(record[k] for k in ("license_status","english_name","mobile_number","mailbox_1","mailbox_2","manager_names_english")):
+            raise RuntimeError(f"Opened Details for search {searched_number}, but none of the requested fields were recognized")
+        return record
 
     def _export(self,c,rid):
         row=c.execute("SELECT * FROM runs WHERE id=?",(rid,)).fetchone(); records=c.execute("SELECT data_json FROM records WHERE run_id=? ORDER BY id",(rid,)).fetchall()

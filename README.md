@@ -4,7 +4,7 @@ A supervised desktop utility for authorized searches on the Growth economic-lice
 
 ## Daily use
 
-Install the macOS DMG or Windows setup executable, then launch **Growth License Scrapper** from Applications/Start Menu/Desktop. The dashboard opens automatically in your default browser. The scraper uses your already-running Chrome and will not open a new browser window or tab. Before a run, enable Chrome remote debugging for that browser session at `chrome://inspect/#remote-debugging` and approve Chrome's prompt. In the same Chrome window, keep an existing Growth portal tab open (or use an existing blank tab). Click **Start** when ready. Complete UAE PASS or CAPTCHA in that tab and press **Resume / I finished login** in the dashboard. The app does not solve or bypass challenges. Stop and closing the app leave Chrome open; closing the app does not remove saved history or exports.
+Install the macOS DMG or Windows setup executable, then launch **Growth License Scrapper** from Applications/Start Menu/Desktop. The dashboard opens automatically in your default browser. The scraper attaches to your already-running Chrome. It reuses an existing Growth/UAE PASS tab when available; otherwise, it opens the portal in a new tab in that same Chrome window. It does not launch another Chrome process. Before a run, enable Chrome remote debugging for that browser session at `chrome://inspect/#remote-debugging` and approve Chrome's prompt. Click **Start** when ready. Complete UAE PASS or CAPTCHA in the portal tab; the app does not solve or bypass challenges. Stop and closing the app leave Chrome open; closing the app does not remove saved history or exports.
 
 ## Build distributable installers
 
