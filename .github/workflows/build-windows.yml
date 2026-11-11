@@ -1,0 +1,57 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build the app with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean --windowed --name "Growth License Scrapper" `
+            --add-data "static;static" `
+            --collect-all playwright `
+            --hidden-import playwright.sync_api `
+            --hidden-import greenlet `
+            app.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build the installer
+        run: |
+          $iscc = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "Inno Setup compiler (ISCC.exe) was not found." }
+          & $iscc "installer.iss"
+
+      - name: Show build output
+        run: Get-ChildItem dist -Recurse -Filter *.exe | Select-Object FullName, Length
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Growth-License-Scrapper-Setup-Windows
+          path: dist/Growth-License-Scrapper-Setup-Windows.exe
+          if-no-files-found: error
