@@ -158,6 +158,14 @@ def xlsx_bytes(headers, rows):
     return buf.getvalue()
 
 
+class PortalAuthRequired(RuntimeError):
+    """The portal lost its signed-in session; the caller must re-authenticate."""
+
+
+class PortalSearchError(RuntimeError):
+    """The portal never answered a search request after retries."""
+
+
 class Runner:
     def __init__(self):
         self.lock = threading.RLock()
@@ -357,7 +365,7 @@ class Runner:
         self._check_stopped()
         self._ensure_english_portal()
         self._check_stopped()
-        num=start; done=0
+        num=start; done=0; consecutive_search_failures=0
         while done < maxn and not self.stop_event.is_set():
             self.pause_event.wait()
             if self.stop_event.is_set(): break
@@ -373,7 +381,33 @@ class Runner:
                         c.execute("INSERT INTO records(run_id,license_number,searched_at,data_json) VALUES (?,?,?,?)",(rid,str(record.get("license_number",num)),now(),json.dumps(record,ensure_ascii=False)))
                 c.execute("UPDATE runs SET searched=searched+1,found=found+? WHERE id=?",(len(recs),rid))
                 log(c,rid,"info",f"License {num}: {'found '+str(len(recs))+' record(s)' if found else 'no result'}")
-                c.commit(); done+=1; num+=1; self.stop_event.wait(interval)
+                c.commit(); done+=1; num+=1; consecutive_search_failures=0; self.stop_event.wait(interval)
+            except PortalAuthRequired:
+                if self.stop_event.is_set(): break
+                log(c,rid,"warning",f"License {num}: the portal session needs signing in again; waiting for login.")
+                c.commit()
+                self._ensure_authenticated(c,rid)
+                if self.stop_event.is_set(): break
+                continue
+            except PortalSearchError as e:
+                if self.stop_event.is_set(): break
+                # Do not stall the whole run on one silent portal search: skip
+                # this number and keep going. Five consecutive failures point
+                # to a systemic problem, so pause for the user to check.
+                c.execute("INSERT OR REPLACE INTO searches(license_number,searched_at,run_id,outcome,error) VALUES (?,?,?,?,?)",(num,now(),rid,"skipped",str(e)))
+                c.execute("UPDATE runs SET searched=searched+1 WHERE id=?",(rid,))
+                log(c,rid,"warning",f"License {num}: {e}. Skipped; continuing with the next number.")
+                c.commit(); done+=1; num+=1; consecutive_search_failures+=1
+                if consecutive_search_failures>=5:
+                    log(c,rid,"error","Five consecutive searches got no answer from the portal; pausing so the session can be checked.")
+                    c.execute("UPDATE runs SET status='paused' WHERE id=?",(rid,)); c.commit()
+                    self.pause_event.clear()
+                    while not self.stop_event.is_set() and not self.pause_event.wait(1):
+                        pass
+                    if self.stop_event.is_set(): break
+                    c.execute("UPDATE runs SET status='running' WHERE id=?",(rid,)); c.commit()
+                    consecutive_search_failures=0
+                continue
             except Exception as e:
                 if self.stop_event.is_set(): break
                 c.execute("INSERT OR REPLACE INTO searches(license_number,searched_at,run_id,outcome,error) VALUES (?,?,?,?,?)",(num,now(),rid,"error",str(e)))
@@ -404,7 +438,11 @@ class Runner:
             if status == "awaiting_login" and self.browser:
                 # Pump Playwright events so redirects and newly opened tabs
                 # are delivered while the worker waits for manual sign-in.
-                self.page.context.pages[0].wait_for_timeout(500)
+                try:
+                    pages=self.page.context.pages if self.page else []
+                    (pages[0] if pages else self.page).wait_for_timeout(500)
+                except Exception:
+                    self.human_event.wait(0.5)
             else:
                 self.human_event.wait(0.5)
 
@@ -606,6 +644,15 @@ class Runner:
         except Exception:
             pass
 
+    def _reload_portal(self,page):
+        """Reset the OutSystems page; returns False when it lands on login."""
+        try:
+            page.goto("https://www.growth.gov.ae/G2C/InquiryAboutEconomicLicenses",wait_until="domcontentloaded",timeout=30000)
+            self._license_search_field(page).wait_for(state="visible",timeout=20000)
+            return True
+        except Exception:
+            return False
+
     def _search_license(self,num):
         self._check_stopped()
         page=self.page
@@ -614,8 +661,10 @@ class Runner:
         # OutSystems app is still hydrating after a navigation, and a search
         # with no matches renders no table at all.
         payload=None; last_error=None
-        for attempt in range(5):
+        for attempt in range(6):
             self._check_stopped()
+            if not self._portal_ready():
+                raise PortalAuthRequired()
             try:
                 target=self._license_search_field(page)
                 target.fill(str(num))
@@ -623,17 +672,23 @@ class Runner:
                 if search.count()==0: search=page.get_by_role("button",name="بحث",exact=True)
                 with page.expect_response(
                     lambda r: "DataActionGetEconomicLicences2" in r.url,
-                    timeout=6000,
+                    timeout=8000,
                 ) as info:
                     search.click()
                 payload=info.value.json()
                 break
             except Exception as e:
                 last_error=e
-                try: page.wait_for_timeout(1200)
-                except Exception: time.sleep(1.2)
+                # The OutSystems page can stop firing search requests after a
+                # long session; reset it, then try again.
+                if attempt >= 1:
+                    if not self._reload_portal(page):
+                        raise PortalAuthRequired()
+                else:
+                    try: page.wait_for_timeout(1000)
+                    except Exception: time.sleep(1.0)
         if payload is None:
-            raise RuntimeError(f"License {num}: the portal did not answer the search request ({last_error}); retry this number")
+            raise PortalSearchError(f"the portal did not answer the search request ({last_error})")
         records=(((payload or {}).get("data") or {}).get("List") or {}).get("List") or []
         if not records:
             return False,[]
