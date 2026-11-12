@@ -282,6 +282,14 @@ class Runner:
         if self.thread and self.thread.is_alive(): self.thread.join(timeout=10)
 
     def _ensure_browser(self,p):
+        # A connection kept from an earlier run becomes stale when Chrome is
+        # restarted or all its windows are closed; it then exposes no browser
+        # contexts. Drop it so this run reconnects instead of failing.
+        try:
+            if self.browser is not None and not self.browser.contexts:
+                self.browser=None
+        except Exception:
+            self.browser=None
         try:
             pages=[page for context in self.browser.contexts for page in context.pages] if self.browser else []
         except Exception:
