@@ -912,8 +912,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
 
 if __name__=="__main__":
-    server=ThreadingHTTPServer(("127.0.0.1",PORT),Handler)
     url=f"http://127.0.0.1:{PORT}"
+    try:
+        server=ThreadingHTTPServer(("127.0.0.1",PORT),Handler)
+    except OSError:
+        # Another copy already serves the dashboard. Open that one instead of
+        # exiting silently (a windowed build shows no error).
+        print(f"A copy of Growth License Scrapper is already running at {url}")
+        if os.environ.get("OPEN_DASHBOARD", "1") != "0":
+            webbrowser.open(url)
+        raise SystemExit(0)
     print(f"Growth License Scrapper is running at {url}")
     if os.environ.get("OPEN_DASHBOARD", "1") != "0":
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
