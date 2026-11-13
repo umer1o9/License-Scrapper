@@ -15,7 +15,7 @@ import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 from xml.sax.saxutils import escape
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -955,7 +955,7 @@ class Handler(BaseHTTPRequestHandler):
             relative_path=unquote(path.removeprefix("/exports/"))
             filepath=(EXPORTS/relative_path).resolve()
             if not filepath.is_relative_to(EXPORTS.resolve()) or not filepath.is_file(): return self.send_error(404)
-            raw=filepath.read_bytes(); self.send_response(200); self.send_header("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"); self.send_header("Content-Disposition",f'attachment; filename="{filepath.name}"'); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            raw=filepath.read_bytes(); self.send_response(200); self.send_header("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"); self.send_header("Content-Disposition",f"attachment; filename=\"{filepath.name}\"; filename*=UTF-8''{quote(filepath.name)}"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         return self.send_error(404)
     def do_POST(self):
         path=urlparse(self.path).path; length=int(self.headers.get("Content-Length",0)); payload=json.loads(self.rfile.read(length) or b"{}")
