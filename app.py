@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import socket
 import sqlite3
@@ -32,6 +33,48 @@ STATIC = ROOT / "static"
 LEGACY_DATA = Path(__file__).resolve().parent / "data"
 FIELDS = ["license_status", "license_number", "english_name", "mobile_number", "mailbox_1", "mailbox_2", "manager_names_english"]
 UAE_PASS_PHONE = os.environ.get("UAE_PASS_PHONE", "")
+
+
+def next_license_number(value):
+    """Increment the variable part of a license number, keeping its format.
+
+    Supported shapes (auto-detected):
+      DMCC-064581    -> DMCC-064582     (text prefix, digits keep their width)
+      CN_3645562     -> CN_3645563      (text prefix)
+      2202345.01     -> 2202346.01      (digits before a dot suffix)
+      2427975        -> 2427976         (plain number)
+      2627017048888  -> 2627017058888   (26 + 7 middle digits + 8888)
+    """
+    s = str(value).strip()
+    if not s:
+        raise ValueError("license number is empty")
+    # Digits before a dot suffix, e.g. 2202345.01 -> 2202346.01
+    match = re.match(r"^(.*?)(\d+)(\.[^.]*)$", s)
+    if match:
+        prefix, digits, suffix = match.groups()
+        return f"{prefix}{str(int(digits)+1).zfill(len(digits))}{suffix}"
+    # Plain number
+    if s.isdigit():
+        if len(s) == 13:
+            # Series such as 2627017048888: first 2 and last 4 stay fixed.
+            prefix, middle, suffix = s[:2], s[2:-4], s[-4:]
+            return f"{prefix}{str(int(middle)+1).zfill(len(middle))}{suffix}"
+        return str(int(s) + 1)
+    # Text prefix followed by digits, e.g. DMCC-064581 or CN_3645562
+    match = re.match(r"^(.*?)(\d+)$", s)
+    if match:
+        prefix, digits = match.groups()
+        return f"{prefix}{str(int(digits)+1).zfill(len(digits))}"
+    raise ValueError(f"cannot find a number to increment in {s!r}")
+
+
+def advance_license_number(value, steps):
+    """Apply next_license_number() the given number of times."""
+    out = str(value)
+    for _ in range(max(0, int(steps or 0))):
+        out = next_license_number(out)
+    return out
+
 
 
 def chrome_devtools_active_port_files():
@@ -98,9 +141,9 @@ def db():
     c.execute("PRAGMA journal_mode=WAL")
     c.executescript("""
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, ended_at TEXT, status TEXT NOT NULL, start_number INTEGER NOT NULL, max_records INTEGER NOT NULL, interval_seconds REAL NOT NULL, searched INTEGER DEFAULT 0, found INTEGER DEFAULT 0, error TEXT, export_path TEXT);
+    CREATE TABLE IF NOT EXISTS runs (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, ended_at TEXT, status TEXT NOT NULL, start_number TEXT NOT NULL, max_records INTEGER NOT NULL, interval_seconds REAL NOT NULL, searched INTEGER DEFAULT 0, found INTEGER DEFAULT 0, error TEXT, export_path TEXT);
     CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, license_number TEXT NOT NULL, searched_at TEXT NOT NULL, data_json TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS searches (license_number INTEGER PRIMARY KEY, searched_at TEXT NOT NULL, run_id INTEGER NOT NULL, outcome TEXT NOT NULL, error TEXT);
+    CREATE TABLE IF NOT EXISTS searches (license_number TEXT PRIMARY KEY, searched_at TEXT NOT NULL, run_id INTEGER NOT NULL, outcome TEXT NOT NULL, error TEXT);
     CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER, created_at TEXT NOT NULL, level TEXT NOT NULL, message TEXT NOT NULL);
     """)
     # One search can legitimately return several businesses with the same
@@ -113,6 +156,18 @@ def db():
         INSERT INTO records_migrated(id,run_id,license_number,searched_at,data_json) SELECT id,run_id,license_number,searched_at,data_json FROM records;
         DROP TABLE records;
         ALTER TABLE records_migrated RENAME TO records;
+        """)
+    # Older databases used INTEGER PRIMARY KEY for searches.license_number.
+    # A rowid alias cannot store formatted numbers (DMCC-064581), so rebuild
+    # the table with a TEXT key.
+    search_cols = c.execute("PRAGMA table_info(searches)").fetchall()
+    if any(row[1] == "license_number" and (row[2] or "").upper() == "INTEGER" for row in search_cols):
+        c.executescript("""
+        CREATE TABLE searches_migrated (license_number TEXT PRIMARY KEY, searched_at TEXT NOT NULL, run_id INTEGER NOT NULL, outcome TEXT NOT NULL, error TEXT);
+        INSERT INTO searches_migrated(license_number,searched_at,run_id,outcome,error)
+            SELECT CAST(license_number AS TEXT),searched_at,run_id,outcome,error FROM searches;
+        DROP TABLE searches;
+        ALTER TABLE searches_migrated RENAME TO searches;
         """)
     for k, v in {"initial_number": "10000", "max_records": "100", "interval_seconds": "2"}.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (k,v))
@@ -182,18 +237,21 @@ class Runner:
     def state(self):
         c=db()
         latest=c.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
-        last=c.execute("SELECT MAX(license_number) AS n FROM searches").fetchone()["n"]
+        last_row=c.execute("SELECT license_number FROM searches ORDER BY searched_at DESC, rowid DESC LIMIT 1").fetchone()
+        last=last_row["license_number"] if last_row else None
         settings={r["key"]:r["value"] for r in c.execute("SELECT * FROM settings")}
         if latest:
-            pending=int(latest["start_number"])+int(latest["searched"] or 0)
+            pending=latest["start_number"]
+            if int(latest["searched"] or 0)>0 and last is not None:
+                pending=next_license_number(last)
             first_error=c.execute(
-                "SELECT MIN(license_number) FROM searches WHERE run_id=? AND outcome='error'",
+                "SELECT license_number FROM searches WHERE run_id=? AND outcome='error' ORDER BY searched_at, rowid LIMIT 1",
                 (latest["id"],),
-            ).fetchone()[0]
+            ).fetchone()
             if first_error is not None:
-                pending=min(pending,int(first_error))
+                pending=first_error["license_number"]
         else:
-            pending=(int(last)+1) if last is not None else int(settings["initial_number"])
+            pending=next_license_number(last) if last is not None else settings["initial_number"]
         count=c.execute("SELECT COUNT(*) FROM searches WHERE substr(searched_at,1,10)=?",(datetime.now().astimezone().date().isoformat(),)).fetchone()[0]
         logs=[dict(r) for r in c.execute("SELECT created_at,level,message FROM logs ORDER BY id DESC LIMIT 30")]
         runs=[dict(r) for r in c.execute("SELECT id,started_at,ended_at,status,start_number,max_records,interval_seconds,searched,found,error,export_path FROM runs ORDER BY id DESC LIMIT 20")]
@@ -205,17 +263,23 @@ class Runner:
             if self.active_run is not None: raise ValueError("A run is already active")
             self._require_chrome_remote_debugging()
             c=db(); st={r["key"]:r["value"] for r in c.execute("SELECT * FROM settings")}
-            last=c.execute("SELECT MAX(license_number) FROM searches").fetchone()[0]
+            last_row=c.execute("SELECT license_number FROM searches ORDER BY searched_at DESC, rowid DESC LIMIT 1").fetchone()
+            last=last_row[0] if last_row else None
             latest=c.execute("SELECT start_number,searched FROM runs ORDER BY id DESC LIMIT 1").fetchone()
-            automatic=(int(latest["start_number"])+int(latest["searched"] or 0)) if latest else ((int(last)+1) if last is not None else int(st["initial_number"]))
             if latest:
+                automatic=latest["start_number"]
+                if int(latest["searched"] or 0)>0 and last is not None:
+                    automatic=next_license_number(last)
                 first_error=c.execute(
-                    "SELECT MIN(license_number) FROM searches WHERE run_id=(SELECT MAX(id) FROM runs) AND outcome='error'"
-                ).fetchone()[0]
+                    "SELECT license_number FROM searches WHERE run_id=(SELECT MAX(id) FROM runs) AND outcome='error' ORDER BY searched_at, rowid LIMIT 1"
+                ).fetchone()
                 if first_error is not None:
-                    automatic=min(automatic,int(first_error))
-            start=int(cfg["start_number"]) if cfg.get("start_number") not in (None,"") else automatic
-            if start < 1: raise ValueError("Starting license number must be at least 1")
+                    automatic=first_error[0]
+            else:
+                automatic=next_license_number(last) if last is not None else st["initial_number"]
+            start=str(cfg["start_number"]).strip() if cfg.get("start_number") not in (None,"") else automatic
+            try: next_license_number(start)
+            except ValueError: raise ValueError("Starting license number must contain a number to increment")
             maxn=int(cfg.get("max_records",st["max_records"])); interval=float(cfg.get("interval_seconds",st["interval_seconds"]))
             if maxn < 1 or maxn > 100000: raise ValueError("Maximum records must be between 1 and 100000")
             if interval < 0.5 or interval > 3600: raise ValueError("Interval must be between 0.5 and 3600 seconds")
@@ -389,7 +453,7 @@ class Runner:
                         c.execute("INSERT INTO records(run_id,license_number,searched_at,data_json) VALUES (?,?,?,?)",(rid,str(record.get("license_number",num)),now(),json.dumps(record,ensure_ascii=False)))
                 c.execute("UPDATE runs SET searched=searched+1,found=found+? WHERE id=?",(len(recs),rid))
                 log(c,rid,"info",f"License {num}: {'found '+str(len(recs))+' record(s)' if found else 'no result'}")
-                c.commit(); done+=1; num+=1; consecutive_search_failures=0; self.stop_event.wait(interval)
+                c.commit(); done+=1; num=next_license_number(num); consecutive_search_failures=0; self.stop_event.wait(interval)
             except PortalAuthRequired:
                 if self.stop_event.is_set(): break
                 log(c,rid,"warning",f"License {num}: the portal session needs signing in again; waiting for login.")
@@ -405,7 +469,7 @@ class Runner:
                 c.execute("INSERT OR REPLACE INTO searches(license_number,searched_at,run_id,outcome,error) VALUES (?,?,?,?,?)",(num,now(),rid,"skipped",str(e)))
                 c.execute("UPDATE runs SET searched=searched+1 WHERE id=?",(rid,))
                 log(c,rid,"warning",f"License {num}: {e}. Skipped; continuing with the next number.")
-                c.commit(); done+=1; num+=1; consecutive_search_failures+=1
+                c.commit(); done+=1; num=next_license_number(num); consecutive_search_failures+=1
                 if consecutive_search_failures>=5:
                     log(c,rid,"error","Five consecutive searches got no answer from the portal; pausing so the session can be checked.")
                     c.execute("UPDATE runs SET status='paused' WHERE id=?",(rid,)); c.commit()
@@ -904,13 +968,14 @@ class Handler(BaseHTTPRequestHandler):
                 c=db()
                 try:
                     current={r["key"]:r["value"] for r in c.execute("SELECT key,value FROM settings")}
-                    initial=int(payload.get("initial_number",current["initial_number"]))
+                    initial=str(payload.get("initial_number",current["initial_number"])).strip()
                     max_records=int(payload.get("max_records",current["max_records"]))
                     interval=float(payload.get("interval_seconds",current["interval_seconds"]))
-                    if initial < 1: raise ValueError("Starting number must be at least 1")
+                    try: next_license_number(initial)
+                    except ValueError: raise ValueError("Starting number must contain a number to increment")
                     if max_records < 1 or max_records > 100000: raise ValueError("Maximum numbers must be between 1 and 100000")
                     if interval < 0.5 or interval > 3600: raise ValueError("Interval must be between 0.5 and 3600 seconds")
-                    c.executemany("UPDATE settings SET value=? WHERE key=?",[(str(initial),"initial_number"),(str(max_records),"max_records"),(str(interval),"interval_seconds")])
+                    c.executemany("UPDATE settings SET value=? WHERE key=?",[(initial,"initial_number"),(str(max_records),"max_records"),(str(interval),"interval_seconds")])
                     c.commit()
                 finally:
                     c.close()
