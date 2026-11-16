@@ -925,7 +925,7 @@ class Runner:
         rows=[]
         for r in records:
             d=json.loads(r["data_json"]); rows.append([d.get(k,"") for k in FIELDS])
-        path.write_bytes(xlsx_bytes(FIELDS,rows)); c.execute("UPDATE runs SET export_path=? WHERE id=?",(str(path.relative_to(EXPORTS)),rid)); c.commit()
+        path.write_bytes(xlsx_bytes(FIELDS,rows)); c.execute("UPDATE runs SET export_path=? WHERE id=?",(path.relative_to(EXPORTS).as_posix(),rid)); c.commit()
 
     def pause(self): self.pause_event.clear()
     def resume(self):
@@ -951,8 +951,24 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/api/state": return self._json(RUNNER.state())
         if path=="/":
             raw=(STATIC/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+        if path.startswith("/api/export/"):
+            try: rid=int(path[len("/api/export/"):].strip("/"))
+            except ValueError: return self.send_error(404)
+            c=db()
+            try: row=c.execute("SELECT export_path FROM runs WHERE id=?",(rid,)).fetchone()
+            finally: c.close()
+            if not row or not row["export_path"]: return self.send_error(404)
+            relative=Path(str(row["export_path"]).replace("\\","/"))
+            filepath=(EXPORTS/relative).resolve()
+            if not filepath.is_relative_to(EXPORTS.resolve()) or not filepath.is_file(): return self.send_error(404)
+            raw=filepath.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            self.send_header("Content-Disposition",f"attachment; filename=\"{filepath.name}\"; filename*=UTF-8''{quote(filepath.name)}")
+            self.send_header("Content-Length",str(len(raw)))
+            self.end_headers(); self.wfile.write(raw); return
         if path.startswith("/exports/"):
-            relative_path=unquote(path.removeprefix("/exports/"))
+            relative_path=unquote(path.removeprefix("/exports/")).replace("\\","/")
             filepath=(EXPORTS/relative_path).resolve()
             if not filepath.is_relative_to(EXPORTS.resolve()) or not filepath.is_file(): return self.send_error(404)
             raw=filepath.read_bytes(); self.send_response(200); self.send_header("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"); self.send_header("Content-Disposition",f"attachment; filename=\"{filepath.name}\"; filename*=UTF-8''{quote(filepath.name)}"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
