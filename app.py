@@ -15,7 +15,7 @@ import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from xml.sax.saxutils import escape
 
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -178,6 +178,16 @@ def db():
 def log(c, run_id, level, msg):
     c.execute("INSERT INTO logs(run_id,created_at,level,message) VALUES (?,?,?,?)", (run_id, now(), level, msg))
     c.commit()
+
+
+def csv_bytes(headers, rows):
+    import csv, io
+    buf=io.StringIO()
+    writer=csv.writer(buf)
+    writer.writerow(headers)
+    writer.writerows(rows)
+    # UTF-8 BOM so Excel opens Arabic text correctly.
+    return ("\ufeff"+buf.getvalue()).encode("utf-8")
 
 
 def xlsx_bytes(headers, rows):
@@ -952,19 +962,35 @@ class Handler(BaseHTTPRequestHandler):
         if path=="/":
             raw=(STATIC/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Cache-Control","no-store"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         if path.startswith("/api/export/"):
-            try: rid=int(path[len("/api/export/"):].strip("/"))
-            except ValueError: return self.send_error(404)
+            parts=path[len("/api/export/"):].strip("/").split("/")
+            try: rid=int(parts[0])
+            except (ValueError, IndexError): return self.send_error(404)
+            query=parse_qs(urlparse(self.path).query)
+            fmt=(query.get("format") or ["xlsx"])[0].lower()
             c=db()
             try: row=c.execute("SELECT export_path FROM runs WHERE id=?",(rid,)).fetchone()
             finally: c.close()
-            if not row or not row["export_path"]: return self.send_error(404)
-            relative=Path(str(row["export_path"]).replace("\\","/"))
-            filepath=(EXPORTS/relative).resolve()
-            if not filepath.is_relative_to(EXPORTS.resolve()) or not filepath.is_file(): return self.send_error(404)
-            raw=filepath.read_bytes()
+            if not row: return self.send_error(404)
+            if fmt=="csv":
+                c=db()
+                try: records=c.execute("SELECT data_json FROM records WHERE run_id=? ORDER BY id",(rid,)).fetchall()
+                finally: c.close()
+                rows=[[json.loads(r["data_json"]).get(k,"") for k in FIELDS] for r in records]
+                stem=Path(str(row["export_path"] or f"Run {rid}.xlsx").replace("\\","/")).stem
+                filename=f"{stem}.csv"
+                raw=csv_bytes(FIELDS,rows)
+                ctype="text/csv; charset=utf-8"
+            else:
+                if not row["export_path"]: return self.send_error(404)
+                relative=Path(str(row["export_path"]).replace("\\","/"))
+                filepath=(EXPORTS/relative).resolve()
+                if not filepath.is_relative_to(EXPORTS.resolve()) or not filepath.is_file(): return self.send_error(404)
+                raw=filepath.read_bytes()
+                filename=filepath.name
+                ctype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             self.send_response(200)
-            self.send_header("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            self.send_header("Content-Disposition",f"attachment; filename=\"{filepath.name}\"; filename*=UTF-8''{quote(filepath.name)}")
+            self.send_header("Content-Type",ctype)
+            self.send_header("Content-Disposition",f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}")
             self.send_header("Content-Length",str(len(raw)))
             self.end_headers(); self.wfile.write(raw); return
         if path.startswith("/exports/"):
