@@ -968,31 +968,42 @@ class Handler(BaseHTTPRequestHandler):
             query=parse_qs(urlparse(self.path).query)
             fmt=(query.get("format") or ["xlsx"])[0].lower()
             c=db()
-            try: row=c.execute("SELECT export_path FROM runs WHERE id=?",(rid,)).fetchone()
-            finally: c.close()
-            if not row: return self.send_error(404)
-            if fmt=="csv":
-                c=db()
-                try: records=c.execute("SELECT data_json FROM records WHERE run_id=? ORDER BY id",(rid,)).fetchall()
-                finally: c.close()
-                rows=[[json.loads(r["data_json"]).get(k,"") for k in FIELDS] for r in records]
-                stem=Path(str(row["export_path"] or f"Run {rid}.xlsx").replace("\\","/")).stem
-                filename=f"{stem}.csv"
-                raw=csv_bytes(FIELDS,rows)
-                ctype="text/csv; charset=utf-8"
-            else:
-                if not row["export_path"]: return self.send_error(404)
-                relative=Path(str(row["export_path"]).replace("\\","/"))
-                filepath=(EXPORTS/relative).resolve()
-                if not filepath.is_relative_to(EXPORTS.resolve()) or not filepath.is_file(): return self.send_error(404)
-                raw=filepath.read_bytes()
-                filename=filepath.name
-                ctype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            self.send_response(200)
-            self.send_header("Content-Type",ctype)
-            self.send_header("Content-Disposition",f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}")
-            self.send_header("Content-Length",str(len(raw)))
-            self.end_headers(); self.wfile.write(raw); return
+            try:
+                row=c.execute("SELECT export_path FROM runs WHERE id=?",(rid,)).fetchone()
+                if not row: return self.send_error(404)
+                if fmt=="csv":
+                    records=c.execute("SELECT data_json FROM records WHERE run_id=? ORDER BY id",(rid,)).fetchall()
+                    rows=[[json.loads(r["data_json"]).get(k,"") for k in FIELDS] for r in records]
+                    stem=Path(str(row["export_path"] or f"Run {rid}.xlsx").replace("\\","/")).stem
+                    filename=f"{stem}.csv"; raw=csv_bytes(FIELDS,rows)
+                    ctype="text/csv; charset=utf-8"
+                else:
+                    if not row["export_path"]: return self.send_error(404)
+                    relative=Path(str(row["export_path"]).replace("\\","/"))
+                    filepath=(EXPORTS/relative).resolve()
+                    filename=filepath.name
+                    raw=None
+                    if filepath.is_relative_to(EXPORTS.resolve()) and filepath.is_file():
+                        raw=filepath.read_bytes()
+                        # A real .xlsx is a ZIP (starts with "PK"). Anything
+                        # else means the saved file is unusable.
+                        if not raw.startswith(b"PK"): raw=None
+                    if raw is None:
+                        # Rebuild from the records so the download never
+                        # returns an error page or a corrupt workbook.
+                        records=c.execute("SELECT data_json FROM records WHERE run_id=? ORDER BY id",(rid,)).fetchall()
+                        if not records: return self.send_error(404)
+                        rows=[[json.loads(r["data_json"]).get(k,"") for k in FIELDS] for r in records]
+                        raw=xlsx_bytes(FIELDS,rows)
+                    ctype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                log(c,None,"info",f"Export download: run {rid} -> {filename} ({len(raw)} bytes)")
+                self.send_response(200)
+                self.send_header("Content-Type",ctype)
+                self.send_header("Content-Disposition",f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}")
+                self.send_header("Content-Length",str(len(raw)))
+                self.end_headers(); self.wfile.write(raw); return
+            finally:
+                c.close()
         if path.startswith("/exports/"):
             relative_path=unquote(path.removeprefix("/exports/")).replace("\\","/")
             filepath=(EXPORTS/relative_path).resolve()
