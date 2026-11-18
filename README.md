@@ -1,44 +1,88 @@
 # Growth License Scrapper
 
-A supervised desktop utility for authorized searches on the Growth economic-license portal. The packaged app runs from a normal app shortcut, opens its local dashboard automatically, and stores its database and Excel exports in the operating system's application-data folder.
+Local dashboard and automation for authorized lookups on the UAE **Growth**
+economic-license portal. It attaches to your already-running Chrome, searches
+license numbers sequentially, opens every result row's Details page, and saves
+each run to SQLite plus an Excel/CSV export.
 
-## Daily use
+> Full documentation: **[PROJECT.md](PROJECT.md)**.
+> Human login (UAE PASS) and CAPTCHA are never automated — the app waits for you.
 
-Install the macOS DMG or Windows setup executable, then launch **Growth License Scrapper** from Applications/Start Menu/Desktop. The dashboard opens automatically in your default browser. The scraper attaches to your already-running Chrome. It reuses an existing Growth/UAE PASS tab when available; otherwise, it opens the portal in a new tab in that same Chrome window. It does not launch another Chrome process. Before a run, enable Chrome remote debugging for that browser session at `chrome://inspect/#remote-debugging` and approve Chrome's prompt. Click **Start** when ready. Complete UAE PASS or CAPTCHA in the portal tab; the app does not solve or bypass challenges. Stop and closing the app leave Chrome open; closing the app does not remove saved history or exports.
+## Quick start (from source)
 
-## Build distributable installers
+**Windows (PowerShell)**
 
-Builds must run on the operating system being packaged (macOS builds on macOS; Windows builds on Windows). This bundles Python, Playwright and the dashboard so recipient laptops do not need Python or terminal commands. Google Chrome must be installed on each computer, and remote debugging must be approved for each Chrome session that will be automated.
-
-### macOS DMG
-
-Install Python 3.10+ and Xcode command-line tools. From Terminal, run:
-
-```sh
-bash build_mac.sh
-```
-
-The installer is `dist/Growth-License-Scrapper-macOS.dmg`. For broad distribution, sign and notarize the app with an Apple Developer certificate.
-
-### Windows installer
-
-On Windows, install Python 3.10+, then run `build_windows.ps1` in PowerShell. Install Inno Setup and compile `installer.iss` to produce `dist/Growth-License-Scrapper-Setup-Windows.exe`.
-
-## Developer run
-
-```sh
-python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\Activate.ps1
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python app.py
 ```
 
-For browser reuse, enable Chrome remote debugging at `chrome://inspect/#remote-debugging`, approve the prompt, and use an existing Growth portal or blank tab. Chrome's permission-based connection does not expose the legacy `/json/version` HTTP API; the app reads Chrome's `DevToolsActivePort` profile file and attaches to its approved WebSocket. If Chrome uses a custom profile directory, set `CHROME_USER_DATA_DIR` to that directory before launching the app. It will not create or commandeer tabs.
+**macOS / Linux**
 
-UAE PASS phone autofill is optional. Set `UAE_PASS_PHONE` in your local environment if you want it enabled; do not commit personal phone numbers or credentials.
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python app.py
+```
 
-Data lives at `~/Library/Application Support/Growth License Scrapper` on macOS, `%LOCALAPPDATA%\\Growth License Scrapper` on Windows, or the XDG data folder on Linux. Exports are under `exports/YYYY-MM-DD/Run N.xlsx`. To back up or transfer history, close the app and copy that data folder.
+The dashboard opens at <http://127.0.0.1:8765/> (`PORT` overrides;
+`OPEN_DASHBOARD=0` skips the automatic tab).
+
+## Chrome setup
+
+In the Chrome profile that has your Growth/UAE PASS session:
+
+1. Open `chrome://inspect/#remote-debugging` and enable it.
+2. Approve Chrome's prompt.
+3. Leave Chrome running; the app attaches via Chrome's `DevToolsActivePort`.
+
+The app never launches a second Chrome or closes your browser.
+
+## License numbers
+
+The start number is text and the incrementing part is auto-detected:
+
+| Start | Next |
+|---|---|
+| `DMCC-064581` | `DMCC-064582` … |
+| `CN_3645562` | `CN_3645563` … |
+| `2202345.01` | `2202346.01` … |
+| `2627017048888` | `2627017058888` … |
+| `2427975` | `2427976` … |
+
+## Exports
+
+Each run has **XLSX** and **CSV** links on the dashboard. Files are served from
+`/api/export/<run_id>/<filename>` and are regenerated from SQLite if a saved
+workbook is missing or corrupt.
+
+## Build installers
+
+- **Windows:** run `build_windows.ps1` on Windows (needs Python 3.10+ and
+  [Inno Setup 6](https://jrsoftware.org/isdl.php)). Output:
+  `dist\Growth-License-Scrapper-Setup-Windows.exe`. CI also builds it via
+  `.github/workflows/build-windows.yml`.
+- **macOS:** `bash build_mac.sh` → `dist/Growth License Scrapper.app` (+ DMG where
+  `hdiutil` is available).
+
+Builds are unsigned; on Windows SmartScreen may ask for **More info → Run anyway**.
+
+## Data
+
+| OS | Path |
+|---|---|
+| macOS | `~/Library/Application Support/Growth License Scrapper` |
+| Windows | `%LOCALAPPDATA%\Growth License Scrapper` |
+| Linux | `$XDG_DATA_HOME/growth-license-scrapper` |
+
+`scraper.sqlite3` holds runs/searches/records/logs; exports live in
+`exports/YYYY-MM-DD/Run N.xlsx`. Override with `LICENSE_SCRAPPER_DATA`.
 
 ## Important
 
-This project requires authorization for portal access and storage of requested personal information. Portal UI selectors and field extraction need validation with an authorized account before extended runs. Confirm the portal's terms, permitted purposes, retention rules and rate limits before collection.
+Use only with explicit authorization for portal access and storage of the requested
+personal information. Confirm the portal's terms, permitted purpose, retention rules
+and rate limits. CAPTCHA and UAE PASS stay under your control.
